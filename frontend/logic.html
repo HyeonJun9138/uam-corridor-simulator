@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>외부 로직 스튜디오</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="studio-body">
+  <header class="topbar studio-topbar">
+    <div class="topbar-left">
+      <button class="topbar-link-btn" id="btn-back-main" type="button">시뮬레이터</button>
+      <h1 class="topbar-title">외부 로직 스튜디오</h1>
+      <span class="topbar-badge">beta</span>
+    </div>
+    <div class="topbar-right studio-topbar-right">
+      <div class="studio-connection" id="logic-connection">연결 대기</div>
+      <button class="topbar-theme-btn" id="btn-theme" title="테마 전환" aria-label="테마 전환">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="studio-layout">
+    <section class="studio-editor-panel">
+      <div class="studio-panel-head">
+        <div>
+          <h2>제어 코드</h2>
+          <p>`control_step(state)` 함수가 매 step마다 호출됩니다.</p>
+        </div>
+        <div class="studio-toolbar">
+          <label class="studio-file-btn" for="logic-file-input">파일 열기</label>
+          <input type="file" id="logic-file-input" accept=".py,.txt">
+          <button class="topbar-link-btn" id="btn-load-sample" type="button">샘플</button>
+        </div>
+      </div>
+
+      <div class="studio-actions">
+        <button class="route-toolbar-btn studio-action-btn studio-action-btn-analyze" id="btn-logic-analyze" type="button">코드 분석</button>
+        <button class="route-toolbar-btn studio-action-btn studio-action-btn-activate" id="btn-logic-activate" type="button">로직 활성화</button>
+        <label class="studio-check">
+          <input type="checkbox" id="chk-auto-apply-params" checked>
+          <span>활성화 시 감지한 파라미터 자동 적용</span>
+        </label>
+      </div>
+
+      <textarea class="studio-code" id="logic-code" spellcheck="false"></textarea>
+
+      <section class="studio-console-card">
+        <div class="studio-card-head">
+          <h3>실행 로그</h3>
+          <button class="topbar-link-btn" id="btn-clear-log" type="button">지우기</button>
+        </div>
+        <pre class="studio-console" id="logic-log"></pre>
+      </section>
+    </section>
+
+    <aside class="studio-side-panel">
+      <section class="studio-card">
+        <div class="studio-card-head">
+          <h3>활성 상태</h3>
+          <span class="studio-pill" id="logic-active-pill">inactive</span>
+        </div>
+        <div class="studio-kv">
+          <div><span>이름</span><strong id="logic-name">-</strong></div>
+          <div><span>분석 상태</span><strong id="logic-analysis-state">-</strong></div>
+          <div><span>제어 함수</span><strong id="logic-function-name">-</strong></div>
+          <div><span>코드 길이</span><strong id="logic-source-stats">-</strong></div>
+          <div><span>감지 파라미터</span><strong id="logic-param-count">0</strong></div>
+          <div><span>경고 / 오류</span><strong id="logic-health-counts">0 / 0</strong></div>
+          <div><span>최근 실행</span><strong id="logic-last-run">-</strong></div>
+          <div><span>최근 명령 수</span><strong id="logic-command-count">0</strong></div>
+          <div><span>최근 실행 시간</span><strong id="logic-runtime-ms">-</strong></div>
+        </div>
+        <div class="studio-card-subtitle">설명</div>
+        <div class="studio-textbox studio-card-scroll studio-card-scroll-sm" id="logic-description-box">설명 없음</div>
+      </section>
+
+      <section class="studio-card">
+        <div class="studio-card-head">
+          <h3>최근 실행 결과</h3>
+          <span class="studio-pill studio-pill-muted" id="logic-run-pill">idle</span>
+        </div>
+        <div class="studio-kv">
+          <div><span>명령 분포</span><strong id="logic-command-breakdown">-</strong></div>
+          <div><span>노트 수</span><strong id="logic-note-count">0</strong></div>
+          <div><span>파라미터 반영</span><strong id="logic-param-apply-count">0</strong></div>
+        </div>
+        <div class="studio-card-subtitle">최근 노트</div>
+        <div class="studio-textbox studio-card-scroll studio-card-scroll-sm" id="logic-last-notes">노트 없음</div>
+        <div class="studio-card-subtitle">최근 파라미터 반영값</div>
+        <pre class="studio-json studio-card-scroll studio-card-scroll-sm" id="logic-last-params">{}</pre>
+        <div class="studio-card-subtitle">최근 오류</div>
+        <div class="studio-textbox studio-error-box studio-card-scroll studio-card-scroll-sm" id="logic-last-error">오류 없음</div>
+      </section>
+
+      <section class="studio-card">
+        <div class="studio-card-head">
+          <h3>분석 결과</h3>
+          <span class="studio-pill studio-pill-muted" id="logic-analysis-pill">미분석</span>
+        </div>
+        <div class="studio-card-scroll studio-card-scroll-md">
+          <div class="studio-analysis-list" id="logic-analysis-summary"></div>
+          <div class="studio-card-subtitle">이 코드를 넣으면</div>
+          <div class="studio-textbox studio-card-scroll studio-card-scroll-md" id="logic-analysis-text">분석 요청 시 예상 동작 설명이 생성됩니다.</div>
+          <div class="studio-card-subtitle">운영 관점 메모</div>
+          <div class="studio-textbox studio-card-scroll studio-card-scroll-sm" id="logic-operator-text">분석 요청 시 운영 메모가 생성됩니다.</div>
+          <div class="studio-issues">
+            <div>
+              <h4>오류</h4>
+              <ul id="logic-errors"></ul>
+            </div>
+            <div>
+              <h4>경고</h4>
+              <ul id="logic-warnings"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="studio-card">
+        <div class="studio-card-head">
+          <h3>감지한 파라미터</h3>
+          <button class="topbar-link-btn" id="btn-apply-detected-params" type="button">적용</button>
+        </div>
+        <div class="studio-card-subtitle">코드에 적힌 override 값</div>
+        <pre class="studio-json studio-card-scroll studio-card-scroll-sm" id="logic-detected-params">{}</pre>
+        <div class="studio-card-subtitle">이 값이 의미하는 것</div>
+        <div class="studio-textbox studio-card-scroll studio-card-scroll-sm" id="logic-detected-params-text">분석 요청 시 파라미터 설명이 생성됩니다.</div>
+      </section>
+
+      <section class="studio-card">
+        <div class="studio-card-head">
+          <h3>현재 시뮬레이션</h3>
+        </div>
+        <div class="studio-kv">
+          <div><span>시각</span><strong id="sim-now">-</strong></div>
+          <div><span>모드</span><strong id="sim-mode">-</strong></div>
+          <div><span>기체 수</span><strong id="sim-count">0</strong></div>
+          <div><span>지연 비율</span><strong id="sim-delay-rate">0%</strong></div>
+          <div><span>총 지연</span><strong id="sim-total-delay">0</strong></div>
+        </div>
+      </section>
+
+      <section class="studio-card studio-card-flex">
+        <div class="studio-card-head">
+          <h3>외부 전달 파일</h3>
+        </div>
+        <div class="studio-card-subtitle">아래 2개 파일을 내려받아 LLM에 함께 넣고, 원하는 교통관리 로직을 설계하게 하면 됩니다.</div>
+        <div class="studio-download-group">
+          <section class="studio-download-block">
+            <div class="studio-download-head">
+              <div>
+                <h4>LLM 입력용 2개 파일</h4>
+                <p>이 두 파일을 그대로 전달한 뒤, 원하는 운영 규칙만 추가로 설명하세요.</p>
+              </div>
+              <a class="topbar-link-btn" href="/api/external-logic-kit/starter.zip">다운로드</a>
+            </div>
+            <div class="studio-download-list">
+              <a class="studio-download-item" href="/api/external-logic-download/sample">
+                <strong>기준 샘플 코드</strong>
+                <span>LLM이 수정 기준으로 삼는 기본 외부 로직 코드</span>
+              </a>
+              <a class="studio-download-item" href="/api/external-logic-download/prompt">
+                <strong>프롬프트 템플릿</strong>
+                <span>LLM에 그대로 넣는 요청 템플릿</span>
+              </a>
+            </div>
+          </section>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="js/logic.js"></script>
+</body>
+</html>

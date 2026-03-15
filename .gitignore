@@ -6,3 +6,5 @@ dist/
 build/
 .vscode/
 .idea/
+api_key
+api_key.txt

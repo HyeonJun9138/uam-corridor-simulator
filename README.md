@@ -34,11 +34,10 @@ uam-corridor-sim/
 pip install -r requirements.txt
 
 # Run server
-cd backend
-python server.py
+python main.py
 ```
 
-Open `http://localhost:8000` in your browser.
+Open the URL printed in the console. The server uses port `8000` when available and automatically falls back to the next open port.
 
 ## Keyboard Shortcuts
 
@@ -64,3 +63,10 @@ Open `http://localhost:8000` in your browser.
 ### Vehicle-centric (기체 기반)
 - Per-aircraft congestion: c = ρ̂ × max(D_avg, R)
 - Forward propagation ratio R for delay cascade detection
+
+## External Logic Docs
+
+- [EXTERNAL_API_GUIDE.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_API_GUIDE.md)
+- [AIRCRAFT_DATA_SCHEMA.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/AIRCRAFT_DATA_SCHEMA.md)
+- [EXTERNAL_LOGIC_STUDIO_GUIDE.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_LOGIC_STUDIO_GUIDE.md)
+- [EXTERNAL_LOGIC_PROMPT_TEMPLATE.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_LOGIC_PROMPT_TEMPLATE.md)
