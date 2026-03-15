@@ -603,8 +603,8 @@ class CorridorRenderer {
     ctx.textAlign = 'center';
     const [sx] = this.worldToScreen(0, 0);
     const [ex] = this.worldToScreen(pathLen, 0);
-    this._drawTextWithHalo(ctx, '시작', sx, topY - 6, palette.textMuted, palette.textHalo, 3);
-    this._drawTextWithHalo(ctx, `종점 (${pathLen / 1000}km)`, ex, topY - 6, palette.textMuted, palette.textHalo, 3);
+    this._drawTextWithHalo(ctx, 'Main Terminal A', sx, topY - 6, palette.textMuted, palette.textHalo, 3);
+    this._drawTextWithHalo(ctx, `Main Terminal B (${pathLen / 1000}km)`, ex, topY - 6, palette.textMuted, palette.textHalo, 3);
   }
 
   _linkLevelColor(level) {
@@ -698,13 +698,25 @@ class CorridorRenderer {
         ctx.save();
         ctx.translate(mx, my);
         ctx.rotate(readableAngle);
+        if (screenLen > 110 && link.display_name) {
+          ctx.font = '700 10px Inter, sans-serif';
+          this._drawTextWithHalo(
+            ctx,
+            String(link.display_name),
+            0,
+            -24,
+            palette.textStrong,
+            palette.textHalo,
+            3
+          );
+        }
         ctx.font = '600 11px Inter, sans-serif';
         ctx.textAlign = 'center';
         this._drawTextWithHalo(
           ctx,
           `${link.count}대 | ${Number(link.v_mean || 0).toFixed(0)} kt`,
           0,
-          -10,
+          -9,
           palette.textStrong,
           palette.textHalo,
           3
@@ -826,7 +838,11 @@ class CorridorRenderer {
         ctx.font = '600 10px Inter, sans-serif';
         ctx.textAlign = 'center';
         const cx = (x0 + x1) / 2;
-        const cy = Math.min(y0, y1) + 14;
+        const top = Math.min(y0, y1);
+        if (seg.display_name) {
+          this._drawTextWithHalo(ctx, String(seg.display_name), cx, top - 8, palette.textStrong, palette.textHalo, 3);
+        }
+        const cy = top + 14;
         this._drawTextWithHalo(ctx, `${seg.count}대 | ${seg.v_mean.toFixed(0)}kt`, cx, cy, palette.textMuted, palette.textHalo, 3);
       }
     }

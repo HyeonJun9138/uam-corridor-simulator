@@ -133,6 +133,7 @@ class Aircraft:
         self.has_departed: bool = self.x_m > 1e-9
         self.depart_t_s: Optional[float] = float(spawn_t_s) if self.has_departed else None
         self.heading_rad: float = 0.0
+        self.follow_global_free_speed: bool = True
         self.action: Optional[str] = None
         self.action_phase: str = "idle"
         self.action_state: Dict[str, Any] = {}
@@ -148,7 +149,7 @@ class Aircraft:
         self.active_link_id: Optional[str] = None
         self.wait_reason: Optional[str] = None
         self.route_mode: bool = False
-        self.data: Dict[str, Any] = {"schema_version": 3}
+        self.data: Dict[str, Any] = {"schema_version": 4}
 
     def set_command_speed(self, v_knots: float):
         self.v_cmd_knots = float(max(0.0, v_knots))
@@ -185,6 +186,8 @@ class SimulationEngine:
         self.route_links: Dict[str, RouteLink] = {}
         self.route_adjacency: Dict[str, List[str]] = {}
         self.route_preview_paths: List[dict] = []
+        self.route_node_names_map: Dict[str, Dict[str, str]] = {}
+        self.route_link_names_map: Dict[str, Dict[str, str]] = {}
         self.node_release_t_s: Dict[str, float] = {}
         self.node_fifo_requests: Dict[str, Dict[int, float]] = {}
         self.normalize_model_params()
@@ -236,6 +239,7 @@ class SimulationEngine:
         pairs = default_straight_link_pairs(self.route_nodes) if use_default_links else []
         self.route_links = build_links(self.route_nodes, pairs)
         self.route_adjacency = build_adjacency(self.route_links)
+        self._refresh_route_name_cache()
         self._reset_route_node_control()
         self._refresh_route_preview_paths()
 
@@ -260,6 +264,7 @@ class SimulationEngine:
     def clear_route_links(self):
         self.route_links = {}
         self.route_adjacency = {}
+        self._refresh_route_name_cache()
         self._reset_route_node_control()
         self._refresh_route_preview_paths()
 
@@ -275,6 +280,7 @@ class SimulationEngine:
         else:
             self.route_links[key] = build_links(self.route_nodes, [(start_id, end_id)])[key]
         self.route_adjacency = build_adjacency(self.route_links)
+        self._refresh_route_name_cache()
         self._reset_route_node_control()
         self._refresh_route_preview_paths()
         return True
@@ -468,6 +474,15 @@ class SimulationEngine:
                 return idx
         return None
 
+    def _route_node_in_degree(self, node_id: Optional[str]) -> int:
+        if node_id is None:
+            return 0
+        target_id = str(node_id)
+        return sum(1 for link in self.route_links.values() if link.end_id == target_id)
+
+    def _route_node_requires_fifo(self, node_id: Optional[str]) -> bool:
+        return self._route_node_in_degree(node_id) > 1
+
     def _route_hold_progress_limit(self, local_s: float, hold_local_s: float, dt: float,
                                    current_ground_mps: float) -> float:
         local_s = float(local_s)
@@ -559,6 +574,216 @@ class SimulationEngine:
 
     def _reachable_route_end_nodes(self, start_node_id: str) -> List[str]:
         return reachable_end_nodes(start_node_id, self.route_nodes, self.route_adjacency)
+
+    def _route_row_display_name(self, row: int) -> str:
+        rows = max(int(self.p.route_row_count), 1)
+        presets = {
+            1: ["Main"],
+            2: ["North", "South"],
+            3: ["North", "Central", "South"],
+            4: ["North", "Upper", "Lower", "South"],
+        }
+        labels = presets.get(rows)
+        if labels and 0 <= row < len(labels):
+            return labels[row]
+        return f"Lane {row + 1}"
+
+    def _route_row_short_code(self, row: int) -> str:
+        label = self._route_row_display_name(row)
+        cleaned = "".join(ch for ch in label if ch.isalnum()).upper()
+        return cleaned[:2] if cleaned else f"R{row + 1}"
+
+    def _alpha_suffix(self, index: int) -> str:
+        value = max(int(index), 0)
+        chars: List[str] = []
+        while True:
+            value, rem = divmod(value, 26)
+            chars.append(chr(ord("A") + rem))
+            if value == 0:
+                break
+            value -= 1
+        return "".join(reversed(chars))
+
+    def _corridor_origin_name(self) -> str:
+        return "Main Terminal A"
+
+    def _corridor_destination_name(self) -> str:
+        return "Main Terminal B"
+
+    def _corridor_segment_names(self, index: int) -> Dict[str, str]:
+        suffix = self._alpha_suffix(index)
+        return {
+            "display_name": f"Main Segment {suffix}",
+            "short_name": f"MAIN-SEG-{suffix}",
+        }
+
+    def _corridor_route_label(self) -> str:
+        return f"{self._corridor_origin_name()} -> {self._corridor_destination_name()}"
+
+    def _build_route_node_names(self, node: RouteNode) -> Dict[str, str]:
+        row_name = self._route_row_display_name(node.row)
+        row_code = self._route_row_short_code(node.row)
+        max_col = max((item.col for item in self.route_nodes.values()), default=node.col)
+        if node.role == "start":
+            return {
+                "display_name": f"{row_name} Terminal A",
+                "short_name": f"{row_code}-TA",
+            }
+        if node.role == "end":
+            return {
+                "display_name": f"{row_name} Terminal B",
+                "short_name": f"{row_code}-TB",
+            }
+        waypoint_idx = min(max(node.col, 1), max_col - 1)
+        return {
+            "display_name": f"{row_name} Waypoint {waypoint_idx}",
+            "short_name": f"{row_code}-WP{waypoint_idx}",
+        }
+
+    def _route_node_names(self, node: RouteNode) -> Dict[str, str]:
+        return dict(self.route_node_names_map.get(node.id) or self._build_route_node_names(node))
+
+    def _build_route_link_names(self, link: RouteLink) -> Dict[str, str]:
+        start = self.route_nodes.get(link.start_id)
+        end = self.route_nodes.get(link.end_id)
+        if start is None or end is None:
+            return {
+                "display_name": link.id,
+                "short_name": link.id,
+            }
+        start_names = self._build_route_node_names(start)
+        end_names = self._build_route_node_names(end)
+        leg_code = chr(ord("A") + max(0, start.col))
+        if start.row == end.row:
+            display_name = f"{self._route_row_display_name(start.row)} Corridor {leg_code}"
+        else:
+            display_name = f"{self._route_row_display_name(start.row)}-{self._route_row_display_name(end.row)} Transfer {leg_code}"
+        short_name = f"{start_names['short_name']} -> {end_names['short_name']}"
+        return {
+            "display_name": display_name,
+            "short_name": short_name,
+        }
+
+    def _route_link_names(self, link: RouteLink) -> Dict[str, str]:
+        return dict(self.route_link_names_map.get(link.id) or self._build_route_link_names(link))
+
+    def _refresh_route_name_cache(self):
+        self.route_node_names_map = {
+            node.id: self._build_route_node_names(node)
+            for node in self.route_nodes.values()
+        }
+        self.route_link_names_map = {
+            link.id: self._build_route_link_names(link)
+            for link in self.route_links.values()
+        }
+
+    def _route_node_label_ref(self, node_id: Optional[str]) -> Dict[str, Optional[str]]:
+        if not node_id:
+            return {
+                "id": None,
+                "display_name": None,
+                "short_name": None,
+            }
+        node = self.route_nodes.get(str(node_id))
+        if node is None:
+            return {
+                "id": str(node_id),
+                "display_name": str(node_id),
+                "short_name": str(node_id),
+            }
+        names = self._route_node_names(node)
+        return {
+            "id": node.id,
+            "display_name": names.get("display_name"),
+            "short_name": names.get("short_name"),
+        }
+
+    def _route_link_label_ref(self, link_id: Optional[str]) -> Dict[str, Optional[str]]:
+        if not link_id:
+            return {
+                "id": None,
+                "display_name": None,
+                "short_name": None,
+            }
+        link = self.route_links.get(str(link_id))
+        if link is None:
+            return {
+                "id": str(link_id),
+                "display_name": str(link_id),
+                "short_name": str(link_id),
+            }
+        names = self._route_link_names(link)
+        return {
+            "id": link.id,
+            "display_name": names.get("display_name"),
+            "short_name": names.get("short_name"),
+        }
+
+    def _route_display_label(self, origin_node_id: Optional[str], destination_node_id: Optional[str]) -> str:
+        origin = self._route_node_label_ref(origin_node_id).get("display_name") or str(origin_node_id or "?")
+        destination = self._route_node_label_ref(destination_node_id).get("display_name") or str(destination_node_id or "?")
+        return f"{origin} -> {destination}"
+
+    def _corridor_segment_label_ref(self, seg_ctx: Optional[dict], seg_idx: Optional[int]) -> Dict[str, Optional[str]]:
+        if seg_ctx:
+            return {
+                "id": f"seg_{int(max(seg_idx or 0, 0)):03d}" if seg_idx is not None and seg_idx >= 0 else None,
+                "display_name": seg_ctx.get("display_name"),
+                "short_name": seg_ctx.get("short_name"),
+            }
+        if seg_idx is None or seg_idx < 0:
+            return {
+                "id": None,
+                "display_name": None,
+                "short_name": None,
+            }
+        names = self._corridor_segment_names(seg_idx)
+        return {
+            "id": f"seg_{seg_idx:03d}",
+            "display_name": names.get("display_name"),
+            "short_name": names.get("short_name"),
+        }
+
+    def _build_external_logic_labels(self, segment_contexts: List[dict]) -> dict:
+        return {
+            "corridor_route": {
+                "origin_display_name": self._corridor_origin_name(),
+                "destination_display_name": self._corridor_destination_name(),
+                "display_name": self._corridor_route_label(),
+            },
+            "corridor_segments": [
+                {
+                    "id": f"seg_{idx:03d}",
+                    "display_name": seg.get("display_name"),
+                    "short_name": seg.get("short_name"),
+                    "x_start_m": round(float(seg.get("x_start", 0.0)), 3),
+                    "x_end_m": round(float(seg.get("x_end", 0.0)), 3),
+                }
+                for idx, seg in enumerate(segment_contexts or [])
+            ],
+            "route_nodes": {
+                node_id: {
+                    "display_name": names.get("display_name"),
+                    "short_name": names.get("short_name"),
+                    "role": self.route_nodes[node_id].role,
+                    "row": int(self.route_nodes[node_id].row),
+                    "col": int(self.route_nodes[node_id].col),
+                }
+                for node_id, names in sorted(self.route_node_names_map.items())
+                if node_id in self.route_nodes
+            },
+            "route_links": {
+                link_id: {
+                    "display_name": names.get("display_name"),
+                    "short_name": names.get("short_name"),
+                    "start_id": self.route_links[link_id].start_id,
+                    "end_id": self.route_links[link_id].end_id,
+                    "length_m": round(float(self.route_links[link_id].length_m), 3),
+                }
+                for link_id, names in sorted(self.route_link_names_map.items())
+                if link_id in self.route_links
+            },
+        }
 
     def _predict_route_travel_time_s(
         self,
@@ -1027,11 +1252,20 @@ class SimulationEngine:
     def delete_aircraft(self, ac_id: int):
         self.aircraft = [ac for ac in self.aircraft if ac.id != ac_id]
 
-    def set_aircraft_speed(self, ac_id: int, v_knots: float):
+    def set_aircraft_speed(self, ac_id: int, v_knots: float, follow_global: bool = False):
         for ac in self.aircraft:
             if ac.id == ac_id:
                 ac.set_command_speed(self._clamp_command_knots(v_knots))
+                ac.follow_global_free_speed = bool(follow_global)
                 return
+
+    def apply_global_free_speed(self, previous_v_free_knots: float):
+        prev_free = self._clamp_command_knots(previous_v_free_knots)
+        new_free = self._clamp_command_knots(self.p.v_free_knots)
+        for ac in self.aircraft:
+            if ac.follow_global_free_speed or abs(ac.v_cmd_knots - prev_free) <= 1e-6:
+                ac.follow_global_free_speed = True
+                ac.set_command_speed(new_free)
 
     def _step_corridor_aircraft(self, corridor_aircraft: List[Aircraft], dt: float):
         if not corridor_aircraft:
@@ -1107,7 +1341,8 @@ class SimulationEngine:
             gap = x_sorted[k - 1] - x_sorted[k]
             v_lead_ground = v_ground_x_sorted[k - 1]
             target_gap = self._target_follow_gap_m(gap, dt)
-            v_safe_ground = v_lead_ground + (gap - target_gap) / max(dt, 1e-6)
+            follow_horizon_s = self._follow_gap_control_horizon_s(dt)
+            v_safe_ground = v_lead_ground + (gap - target_gap) / max(follow_horizon_s, 1e-6)
             v_safe_ground = max(0.0, v_safe_ground)
             v_safe_air = max(0.0, v_safe_ground - wx)
             v_desired = min(v_cmd_sorted[k], v_safe_air, v_max_mps)
@@ -1196,14 +1431,11 @@ class SimulationEngine:
         t = min(max(float(x), 0.0), 1.0)
         return t * t * (3.0 - 2.0 * t)
 
-    def _target_follow_gap_m(self, current_gap_m: float, dt: float) -> float:
-        gap_m = max(0.0, float(current_gap_m))
-        if gap_m >= self.p.sep_min_m:
-            return float(self.p.sep_min_m)
+    def _follow_gap_control_horizon_s(self, dt: float) -> float:
+        return max(4.0, 20.0 * max(float(dt), 1e-6))
 
-        recovery_horizon_s = max(2.0, 8.0 * max(dt, 1e-6))
-        gain = min(1.0, max(dt, 1e-6) / recovery_horizon_s)
-        return min(float(self.p.sep_min_m), gap_m + (float(self.p.sep_min_m) - gap_m) * gain)
+    def _target_follow_gap_m(self, current_gap_m: float, dt: float) -> float:
+        return float(self.p.sep_min_m)
 
     def _update_turn_action(self, ac: Aircraft, dt: float):
         state = ac.action_state
@@ -1675,6 +1907,7 @@ class SimulationEngine:
                 allowed_local = proposed_local
                 wait_reason: Optional[str] = None
                 exit_node_id = str(link_state["exit_node_id"])
+                exit_node_requires_fifo = self._route_node_requires_fifo(exit_node_id)
                 crossed_exit = False
 
                 if math.isfinite(lead_final_local):
@@ -1706,7 +1939,9 @@ class SimulationEngine:
                     + hold_buffer_m
                     + max(current_ground_mps, ground_mps) * self.p.fifo_approach_time_s,
                 )
-                if remaining_to_node_m <= approach_window_m + 1e-9 or allowed_local > link_length + 1e-9:
+                if exit_node_requires_fifo and (
+                    remaining_to_node_m <= approach_window_m + 1e-9 or allowed_local > link_length + 1e-9
+                ):
                     request_dt_s = max(
                         0.0,
                         remaining_to_node_m / max(max(ground_mps, current_ground_mps), 1e-6),
@@ -1714,10 +1949,11 @@ class SimulationEngine:
                     self._register_route_node_request(exit_node_id, ac.id, self.t_s + request_dt_s)
 
                     queue_head_id = self._peek_route_node_request(exit_node_id)
+                    is_queue_head = queue_head_id == ac.id
                     node_release = self.node_release_t_s.get(exit_node_id, 0.0)
                     merge_release_extra_s = 0.0
                     blocked_reason: Optional[str] = None
-                    if queue_head_id != ac.id:
+                    if not is_queue_head:
                         blocked_reason = "fifo_hold"
                     elif self.t_s < node_release - 1e-9:
                         blocked_reason = "node_hold"
@@ -1736,23 +1972,38 @@ class SimulationEngine:
 
                     if blocked_reason is not None:
                         queue_rank = self._route_node_request_rank(exit_node_id, ac.id) or 0
-                        scheduled_service_dt_s = max(
-                            dt,
-                            max(0.0, node_release - self.t_s) + queue_rank * max(node_headway_s, queue_service_gap_s),
-                        )
-                        if blocked_reason == "merge_hold":
-                            scheduled_service_dt_s += node_headway_s + merge_release_extra_s
-
                         approach_local = max(
                             float(link_state["local_s"]),
                             link_length - 1.0,
                         )
                         remaining_hold_m = max(0.0, approach_local - float(link_state["local_s"]))
-                        sync_target_mps = remaining_hold_m / max(scheduled_service_dt_s, 1e-6)
+                        min_ground_hold_mps = max(0.0, self.p.v_min_knots * KNOT_TO_MPS + along_wind_mps)
+                        min_ground_stop_distance_m = (
+                            (min_ground_hold_mps ** 2) / max(2.0 * max(self.p.b_max_mps2, 1e-6), 1e-6)
+                        )
                         stop_target_mps = math.sqrt(
                             max(0.0, 2.0 * max(self.p.b_max_mps2, 1e-6) * remaining_hold_m)
                         )
-                        target_ground_mps = min(stop_target_mps, sync_target_mps)
+                        if is_queue_head and blocked_reason in {"node_hold", "merge_hold"}:
+                            # Queue head keeps its nominal speed until braking is actually needed near the node.
+                            target_ground_mps = stop_target_mps
+                        else:
+                            scheduled_service_dt_s = max(
+                                dt,
+                                max(0.0, node_release - self.t_s) + queue_rank * max(node_headway_s, queue_service_gap_s),
+                            )
+                            if blocked_reason == "merge_hold":
+                                scheduled_service_dt_s += node_headway_s + merge_release_extra_s
+                            sync_target_mps = remaining_hold_m / max(scheduled_service_dt_s, 1e-6)
+                            target_ground_mps = min(stop_target_mps, sync_target_mps)
+                            if remaining_hold_m > max(8.0, 0.5 * hold_buffer_m):
+                                crawl_target_mps = min(
+                                    remaining_hold_m / max(dt, 1e-6),
+                                    max(1.5, 0.12 * self.p.v_free_knots * KNOT_TO_MPS),
+                                )
+                                target_ground_mps = max(target_ground_mps, crawl_target_mps)
+                        if remaining_hold_m > min_ground_stop_distance_m + max(6.0, 0.35 * hold_buffer_m):
+                            target_ground_mps = max(target_ground_mps, min_ground_hold_mps)
                         hold_limit = min(
                             approach_local,
                             float(link_state["local_s"]) + self._advance_speed_target(
@@ -1781,6 +2032,8 @@ class SimulationEngine:
                                 self.node_release_t_s.get(exit_node_id, 0.0),
                                 self.t_s + node_headway_s,
                             )
+                elif not exit_node_requires_fifo:
+                    self._clear_route_node_request(exit_node_id, ac.id)
 
                 final_local = max(0.0, allowed_local)
                 new_progress = float(link_state["start_s"]) + final_local
@@ -1801,8 +2054,11 @@ class SimulationEngine:
                 ac.wind_x_mps = float(wx_new_mps)
                 ac.wind_y_mps = float(wy_new_mps)
                 distance_m = max(0.0, ac.route_progress_m - prev_progress)
-                ac.ground_vx_mps = math.cos(heading_new) * (distance_m / max(dt, 1e-6))
-                ac.ground_vy_mps = math.sin(heading_new) * (distance_m / max(dt, 1e-6))
+                actual_ground_mps = distance_m / max(dt, 1e-6)
+                along_wind_new_mps = wx_new_mps * math.cos(heading_new) + wy_new_mps * math.sin(heading_new)
+                ac.v_act_mps = max(0.0, actual_ground_mps - along_wind_new_mps)
+                ac.ground_vx_mps = math.cos(heading_new) * actual_ground_mps
+                ac.ground_vy_mps = math.sin(heading_new) * actual_ground_mps
                 ac.wait_reason = wait_reason
                 if crossed_exit:
                     self._clear_route_node_request(exit_node_id, ac.id)
@@ -2019,8 +2275,9 @@ class SimulationEngine:
         wind_y_mps = np.array([ac.wind_y_mps for ac in self.aircraft], dtype=float)
         ground_vx_mps = np.array([ac.ground_vx_mps for ac in self.aircraft], dtype=float)
         ground_vy_mps = np.array([ac.ground_vy_mps for ac in self.aircraft], dtype=float)
-        v_act_knots = np.maximum(0.0, ground_vx_mps) * MPS_TO_KNOT
         v_ground_knots = np.hypot(ground_vx_mps, ground_vy_mps) * MPS_TO_KNOT
+        v_progress_knots = np.maximum(0.0, ground_vx_mps) * MPS_TO_KNOT
+        v_act_knots = v_ground_knots.copy()
         v_cmd_knots = np.array([ac.v_cmd_knots for ac in self.aircraft], dtype=float)
         include_in_flow = np.array([ac.action is None for ac in self.aircraft], dtype=bool)
         spawn_t_s = np.array([ac.spawn_t_s for ac in self.aircraft], dtype=float)
@@ -2039,7 +2296,7 @@ class SimulationEngine:
         tti = np.where(sched_total_s > 1e-9, est_total_s / sched_total_s, 1.0)
 
         v_free = self.p.v_free_knots
-        l = np.maximum(0.0, 1.0 - (v_act_knots / max(v_free, 1e-9)))
+        l = np.maximum(0.0, 1.0 - (v_progress_knots / max(v_free, 1e-9)))
         D = np.array([ac.D_s for ac in self.aircraft], dtype=float)
         rho = np.zeros_like(x, dtype=float)
         R = np.zeros_like(x, dtype=float)
@@ -2088,6 +2345,7 @@ class SimulationEngine:
             "remaining_m": remaining_m,
             "v_act_knots": v_act_knots,
             "v_ground_knots": v_ground_knots,
+            "v_progress_knots": v_progress_knots,
             "v_cmd_knots": v_cmd_knots,
             "wind_x_knots": wind_x_mps * MPS_TO_KNOT,
             "wind_y_knots": wind_y_mps * MPS_TO_KNOT,
@@ -2272,6 +2530,7 @@ class SimulationEngine:
             segments.append({
                 "x_start": float(x_min + i * seg_len),
                 "x_end": float(x_min + (i + 1) * seg_len),
+                **self._corridor_segment_names(i),
                 "score": s,
                 "level": level,
                 "count": int(counts[i]),
@@ -2350,8 +2609,10 @@ class SimulationEngine:
         starts = []
         for node in self._route_start_nodes():
             reachable_ids = self._reachable_route_end_nodes(node.id)
+            names = self._route_node_names(node)
             starts.append({
                 **node.to_dict(),
+                **names,
                 "reachable_end_ids": reachable_ids,
                 "spawn_enabled": bool(reachable_ids),
             })
@@ -2359,8 +2620,10 @@ class SimulationEngine:
         links = []
         for link in self.route_links.values():
             metric = metrics_by_id.get(link.id, {})
+            names = self._route_link_names(link)
             links.append({
                 **link.to_dict(),
+                **names,
                 "score": float(metric.get("score", 0.0)),
                 "level": int(metric.get("level", 0)),
                 "count": int(metric.get("count", 0)),
@@ -2368,7 +2631,13 @@ class SimulationEngine:
             })
 
         return {
-            "nodes": [node.to_dict() for node in sorted(self.route_nodes.values(), key=lambda item: (item.col, item.row))],
+            "nodes": [
+                {
+                    **node.to_dict(),
+                    **self._route_node_names(node),
+                }
+                for node in sorted(self.route_nodes.values(), key=lambda item: (item.col, item.row))
+            ],
             "links": links,
             "paths": list(self.route_preview_paths),
             "start_nodes": starts,
@@ -2626,14 +2895,23 @@ class SimulationEngine:
                 link_metric = route_segment_metrics.get(ac.active_link_id or "", {})
                 route_link = self.route_links.get(ac.active_link_id or "")
                 exit_node_id = str(route_state["exit_node_id"]) if route_state else None
+                node_fifo_enabled = self._route_node_requires_fifo(exit_node_id)
                 request_t_s = None
-                if exit_node_id is not None:
+                if exit_node_id is not None and node_fifo_enabled:
                     request_t_s = self.node_fifo_requests.get(exit_node_id, {}).get(ac.id)
-                queue_rank = self._route_node_request_rank(exit_node_id, ac.id) if exit_node_id is not None else None
-                queue_entries = self.node_fifo_requests.get(exit_node_id, {}) if exit_node_id is not None else {}
+                queue_rank = (
+                    self._route_node_request_rank(exit_node_id, ac.id)
+                    if exit_node_id is not None and node_fifo_enabled
+                    else None
+                )
+                queue_entries = self.node_fifo_requests.get(exit_node_id, {}) if exit_node_id is not None and node_fifo_enabled else {}
                 queue_size = len(queue_entries)
-                queue_head_id = self._peek_route_node_request(exit_node_id) if exit_node_id is not None else None
-                node_release_t_s = float(self.node_release_t_s.get(exit_node_id, 0.0)) if exit_node_id is not None else None
+                queue_head_id = self._peek_route_node_request(exit_node_id) if exit_node_id is not None and node_fifo_enabled else None
+                node_release_t_s = (
+                    float(self.node_release_t_s.get(exit_node_id, 0.0))
+                    if exit_node_id is not None and node_fifo_enabled
+                    else None
+                )
                 next_link_id = str(route_state["next_link_id"]) if route_state and route_state.get("next_link_id") else None
                 downstream_positions = route_link_locals.get(next_link_id, []) if next_link_id else []
                 downstream_nearest_gap_m = float(min(downstream_positions)) if downstream_positions else None
@@ -2659,7 +2937,11 @@ class SimulationEngine:
                 downstream_open = (
                     downstream_nearest_gap_m is None or downstream_nearest_gap_m >= self.p.sep_min_m - 1e-9
                 )
-                can_cross_node_now = bool(queue_head and release_open and downstream_open)
+                can_cross_node_now = (
+                    bool(queue_head and release_open and downstream_open)
+                    if node_fifo_enabled
+                    else True
+                )
                 link_capacity = (
                     float(route_link.length_m / max(self.p.sep_min_m, 1e-6))
                     if route_link is not None
@@ -2690,6 +2972,7 @@ class SimulationEngine:
                     "overflow_ratio": round(max(0.0, float(occupancy_ratio) - 1.0), 3) if occupancy_ratio is not None else None,
                 }
                 fifo_context = {
+                    "enabled": bool(node_fifo_enabled),
                     "queue_rank": int(queue_rank) if queue_rank is not None else None,
                     "request_time_s": round(float(request_t_s), 3) if request_t_s is not None else None,
                     "request_age_s": round(float(max(0.0, self.t_s - request_t_s)), 3) if request_t_s is not None else None,
@@ -2707,7 +2990,7 @@ class SimulationEngine:
                     "next_link_nearest_gap_m": round(float(downstream_nearest_gap_m), 3) if downstream_nearest_gap_m is not None else None,
                     "next_link_sep_margin_m": round(float(downstream_sep_margin_m), 3) if downstream_sep_margin_m is not None else None,
                     "can_cross_node_now": bool(can_cross_node_now),
-                    "can_enter_next_link_now": bool(downstream_open),
+                    "can_enter_next_link_now": bool(downstream_open) if node_fifo_enabled else True,
                 }
                 current_link_index = int(route_state["index"]) if route_state else 0
                 operations_context = {
@@ -2747,7 +3030,7 @@ class SimulationEngine:
                 local_context = {
                     "kind": "corridor_segment",
                     "index": seg_idx if seg_idx >= 0 else None,
-                    "id": f"seg-{seg_idx}" if seg_idx >= 0 else None,
+                    "id": f"seg_{seg_idx:03d}" if seg_idx >= 0 else None,
                     "x_start_m": round(float(seg_ctx["x_start"]), 1) if seg_ctx else None,
                     "x_end_m": round(float(seg_ctx["x_end"]), 1) if seg_ctx else None,
                     "count": seg_count,
@@ -2759,6 +3042,7 @@ class SimulationEngine:
                     "overflow_ratio": round(max(0.0, float(occupancy_ratio) - 1.0), 3),
                 }
                 fifo_context = {
+                    "enabled": False,
                     "queue_rank": None,
                     "request_time_s": None,
                     "request_age_s": None,
@@ -2810,8 +3094,76 @@ class SimulationEngine:
                     "is_on_final_path_element": bool(seg_idx >= segment_count - 1) if seg_idx >= 0 and segment_count > 0 else None,
                 }
 
+            origin_label = self._route_node_label_ref(ac.origin_node_id) if ac.route_mode else {
+                "id": None,
+                "display_name": self._corridor_origin_name(),
+                "short_name": "MAIN-TA",
+            }
+            destination_label = self._route_node_label_ref(ac.destination_node_id) if ac.route_mode else {
+                "id": None,
+                "display_name": self._corridor_destination_name(),
+                "short_name": "MAIN-TB",
+            }
+            route_display_name = (
+                self._route_display_label(ac.origin_node_id, ac.destination_node_id)
+                if ac.route_mode
+                else self._corridor_route_label()
+            )
+            route_node_labels = [
+                self._route_node_label_ref(node_id)
+                for node_id in ac.route_node_ids
+            ] if ac.route_mode else []
+            route_link_labels = [
+                self._route_link_label_ref(link_id)
+                for link_id in ac.route_link_ids
+            ] if ac.route_mode else []
+            active_link_label = self._route_link_label_ref(ac.active_link_id) if ac.route_mode else self._corridor_segment_label_ref(seg_ctx, seg_idx)
+            next_link_label = self._route_link_label_ref(local_context.get("next_link_id")) if ac.route_mode else {
+                "id": None,
+                "display_name": None,
+                "short_name": None,
+            }
+            entry_node_label = self._route_node_label_ref(local_context.get("entry_node_id")) if ac.route_mode else {
+                "id": None,
+                "display_name": self._corridor_origin_name(),
+                "short_name": "MAIN-TA",
+            }
+            exit_node_label = self._route_node_label_ref(local_context.get("exit_node_id")) if ac.route_mode else {
+                "id": None,
+                "display_name": self._corridor_destination_name(),
+                "short_name": "MAIN-TB",
+            }
+            corridor_segment_label = self._corridor_segment_label_ref(seg_ctx, seg_idx) if not ac.route_mode else {
+                "id": None,
+                "display_name": None,
+                "short_name": None,
+            }
+            operations_context["route_display_name"] = route_display_name
+            operations_context["origin_display_name"] = origin_label.get("display_name")
+            operations_context["destination_display_name"] = destination_label.get("display_name")
+            operations_context["active_link_display_name"] = active_link_label.get("display_name")
+            operations_context["active_link_short_name"] = active_link_label.get("short_name")
+            operations_context["entry_node_display_name"] = entry_node_label.get("display_name")
+            operations_context["exit_node_display_name"] = exit_node_label.get("display_name")
+            operations_context["next_link_display_name"] = next_link_label.get("display_name")
+            fifo_context["entry_node_display_name"] = entry_node_label.get("display_name")
+            fifo_context["entry_node_short_name"] = entry_node_label.get("short_name")
+            fifo_context["exit_node_display_name"] = exit_node_label.get("display_name")
+            fifo_context["exit_node_short_name"] = exit_node_label.get("short_name")
+            fifo_context["next_link_display_name"] = next_link_label.get("display_name")
+            fifo_context["next_link_short_name"] = next_link_label.get("short_name")
+            local_context["display_name"] = active_link_label.get("display_name")
+            local_context["short_name"] = active_link_label.get("short_name")
+            local_context["route_display_name"] = route_display_name
+            local_context["entry_node_display_name"] = entry_node_label.get("display_name")
+            local_context["entry_node_short_name"] = entry_node_label.get("short_name")
+            local_context["exit_node_display_name"] = exit_node_label.get("display_name")
+            local_context["exit_node_short_name"] = exit_node_label.get("short_name")
+            local_context["next_link_display_name"] = next_link_label.get("display_name")
+            local_context["next_link_short_name"] = next_link_label.get("short_name")
+
             ac.data = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "identity": {
                     "aircraft_id": int(ac.id),
                     "simulation_mode": "route" if ac.route_mode else "corridor",
@@ -2829,8 +3181,15 @@ class SimulationEngine:
                 "mission": {
                     "origin_node_id": ac.origin_node_id,
                     "destination_node_id": ac.destination_node_id,
+                    "origin_display_name": origin_label.get("display_name"),
+                    "origin_short_name": origin_label.get("short_name"),
+                    "destination_display_name": destination_label.get("display_name"),
+                    "destination_short_name": destination_label.get("short_name"),
+                    "route_display_name": route_display_name,
                     "route_node_ids": list(ac.route_node_ids),
+                    "route_node_labels": route_node_labels,
                     "route_link_ids": list(ac.route_link_ids),
+                    "route_link_labels": route_link_labels,
                 },
                 "position": {
                     "x_m": round(float(ac.x_m), 3),
@@ -2890,6 +3249,7 @@ class SimulationEngine:
                         "can_issue_now": True,
                         "command_knots": round(float(ac.v_cmd_knots), 3),
                         "actual_knots": round(float(metrics["v_act_knots"][i]), 3),
+                        "follows_global_free_speed": bool(ac.follow_global_free_speed),
                         "allowed_min_knots": round(float(self.p.v_min_knots), 3),
                         "allowed_max_knots": round(float(self.p.v_max_knots), 3),
                         "default_free_knots": round(float(self.p.v_free_knots), 3),
@@ -3112,5 +3472,63 @@ class SimulationEngine:
                 "cong_ref": self.p.cong_ref,
                 "dt_s": self.p.dt_s,
                 "realtime_factor": self.p.realtime_factor,
+            },
+        }
+
+    def get_external_logic_state(self) -> dict:
+        metrics = self.compute_metrics()
+        segment_contexts = self.compute_segment_congestion(metrics)
+        self._refresh_aircraft_data(metrics, segment_contexts)
+
+        return {
+            "t": round(float(self.t_s), 3),
+            "mode": self.p.simulation_mode,
+            "aircraft": [
+                {
+                    "id": int(ac.id),
+                    "data": ac.data,
+                }
+                for ac in self.aircraft
+            ],
+            "summary": self.compute_summary(metrics),
+            "labels": self._build_external_logic_labels(segment_contexts),
+            "params": {
+                "simulation_mode": self.p.simulation_mode,
+                "dt_s": self.p.dt_s,
+                "realtime_factor": self.p.realtime_factor,
+                "path_length_m": self.p.path_length_m,
+                "lane_width_m": self.p.lane_width_m,
+                "spawn_margin_m": self.p.spawn_margin_m,
+                "auto_spawn_enabled": self.p.auto_spawn_enabled,
+                "spawn_spacing_m": self.p.spawn_spacing_m,
+                "route_grid_spacing_m": self.p.route_grid_spacing_m,
+                "route_row_count": self.p.route_row_count,
+                "route_row_gap_m": self.p.route_row_gap_m,
+                "v_free_knots": self.p.v_free_knots,
+                "v_init_knots": self.p.v_init_knots,
+                "v_min_knots": self.p.v_min_knots,
+                "v_max_knots": self.p.v_max_knots,
+                "wind_enabled": self.p.wind_enabled,
+                "wind_level": self.p.wind_level,
+                "a_max_mps2": self.p.a_max_mps2,
+                "b_max_mps2": self.p.b_max_mps2,
+                "sep_min_m": self.p.sep_min_m,
+                "fifo_queue_sep_scale": self.p.fifo_queue_sep_scale,
+                "fifo_node_clearance_min_m": self.p.fifo_node_clearance_min_m,
+                "fifo_node_clearance_scale": self.p.fifo_node_clearance_scale,
+                "fifo_hold_buffer_min_m": self.p.fifo_hold_buffer_min_m,
+                "fifo_hold_buffer_scale": self.p.fifo_hold_buffer_scale,
+                "fifo_approach_sep_scale": self.p.fifo_approach_sep_scale,
+                "fifo_approach_time_s": self.p.fifo_approach_time_s,
+                "segment_length_m": self.p.segment_length_m,
+                "seg_w_overflow": self.p.seg_w_overflow,
+                "seg_w_tti": self.p.seg_w_tti,
+                "sigma_parallel_m": self.p.sigma_parallel_m,
+                "sigma_perp_m": self.p.sigma_perp_m,
+                "lookahead_L_m": self.p.lookahead_L_m,
+                "delay_window_T_s": self.p.delay_window_T_s,
+                "delayed_thr_s": self.p.delayed_thr_s,
+                "rho_ref": self.p.rho_ref,
+                "cong_ref": self.p.cong_ref,
             },
         }

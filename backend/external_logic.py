@@ -113,15 +113,21 @@ class ExternalLogicController:
         self.source = ""
         self.namespace: Dict[str, Any] = {}
         self.control_step: Optional[Callable[[dict], Any]] = None
+        self.logic_min_interval_s = 0.0
+        self.next_run_t_s = 0.0
         self.analysis: Dict[str, Any] = {}
         self.analysis_explanation: Dict[str, Any] = {}
         self.analysis_explanation_source = ""
         self.last_error: Optional[str] = None
         self.last_traceback: Optional[str] = None
+        self.runtime_ema_ms: Optional[float] = None
+        self.slow_run_count = 0
+        self.performance_warning: Optional[str] = None
         self.last_result: Dict[str, Any] = {
             "command_count": 0,
             "last_run_s": None,
             "last_runtime_ms": None,
+            "skipped": False,
             "params_applied": {},
             "commands_by_action": {},
             "commands_preview": [],
@@ -148,6 +154,7 @@ class ExternalLogicController:
             "functions": [],
             "logic_name": None,
             "logic_description": None,
+            "logic_min_interval_s": 0.0,
             "detected_params": {},
             "errors": [],
             "warnings": [],
@@ -201,6 +208,11 @@ class ExternalLogicController:
             elif target.id == "LOGIC_DESCRIPTION":
                 if isinstance(literal, str):
                     analysis["logic_description"] = literal
+            elif target.id == "LOGIC_MIN_INTERVAL_S":
+                if isinstance(literal, (int, float)):
+                    analysis["logic_min_interval_s"] = max(0.0, float(literal))
+                else:
+                    analysis["warnings"].append("`LOGIC_MIN_INTERVAL_S`는 숫자여야 합니다.")
 
         if not analysis["errors"]:
             analysis["ok"] = True
@@ -379,10 +391,13 @@ class ExternalLogicController:
                 analysis["detected_params"] = dict(runtime_params)
             logic_name = env.get("LOGIC_NAME")
             logic_description = env.get("LOGIC_DESCRIPTION")
+            logic_min_interval_s = env.get("LOGIC_MIN_INTERVAL_S")
             if isinstance(logic_name, str) and logic_name.strip():
                 analysis["logic_name"] = logic_name.strip()
             if isinstance(logic_description, str) and logic_description.strip():
                 analysis["logic_description"] = logic_description.strip()
+            if isinstance(logic_min_interval_s, (int, float)):
+                analysis["logic_min_interval_s"] = max(0.0, float(logic_min_interval_s))
 
             probe_output = control_step(self._build_probe_state(probe_state))
             self._normalize_output(probe_output)
@@ -403,10 +418,16 @@ class ExternalLogicController:
         self.last_traceback = None
         self.logic_name = analysis.get("logic_name") or "사용자 로직"
         self.logic_description = analysis.get("logic_description") or ""
+        self.logic_min_interval_s = max(0.0, float(analysis.get("logic_min_interval_s", 0.0) or 0.0))
+        self.next_run_t_s = 0.0
+        self.runtime_ema_ms = None
+        self.slow_run_count = 0
+        self.performance_warning = None
         self.last_result = {
             "command_count": 0,
             "last_run_s": None,
             "last_runtime_ms": None,
+            "skipped": False,
             "params_applied": {},
             "commands_by_action": {},
             "commands_preview": [],
@@ -419,22 +440,68 @@ class ExternalLogicController:
         self.active = False
         self.namespace = {}
         self.control_step = None
+        self.logic_min_interval_s = 0.0
+        self.next_run_t_s = 0.0
         return self.get_status()
+
+    def should_skip_for_cadence(self, sim_t: float) -> bool:
+        return self.logic_min_interval_s > 0.0 and float(sim_t) + 1e-9 < self.next_run_t_s
+
+    def record_cadence_skip(self, sim_t: float) -> None:
+        self.last_result = {
+            "command_count": 0,
+            "last_run_s": time.time(),
+            "last_runtime_ms": 0.0,
+            "skipped": True,
+            "params_applied": {},
+            "commands_by_action": {},
+            "commands_preview": [],
+            "note_count": 0,
+            "notes": [f"cadence_skip at t={round(float(sim_t), 3)} until {round(self.next_run_t_s, 3)}"],
+        }
 
     def run_step(self, state: dict) -> Dict[str, Any]:
         if not self.active or self.control_step is None:
             return {"ok": False, "commands": [], "params": {}, "notes": []}
 
+        sim_t = 0.0
+        if isinstance(state, dict):
+            try:
+                sim_t = float(state.get("t", 0.0))
+            except (TypeError, ValueError):
+                sim_t = 0.0
+
+        if self.logic_min_interval_s > 0.0 and sim_t + 1e-9 < self.next_run_t_s:
+            self.record_cadence_skip(sim_t)
+            return {"ok": True, "commands": [], "params": {}, "notes": [], "skipped": True}
+
         started = time.perf_counter()
         try:
-            output = self.control_step(copy.deepcopy(state))
+            output = self.control_step(state)
             result = self._normalize_output(output)
             runtime_ms = (time.perf_counter() - started) * 1000.0
+            if self.logic_min_interval_s > 0.0:
+                self.next_run_t_s = sim_t + self.logic_min_interval_s
+            self.runtime_ema_ms = (
+                runtime_ms if self.runtime_ema_ms is None else (0.8 * self.runtime_ema_ms + 0.2 * runtime_ms)
+            )
+            if runtime_ms >= 20.0:
+                self.slow_run_count += 1
+            else:
+                self.slow_run_count = max(0, self.slow_run_count - 1)
+            if self.runtime_ema_ms >= 20.0 or self.slow_run_count >= 5:
+                self.performance_warning = (
+                    f"external logic is slow ({round(self.runtime_ema_ms, 2)} ms avg). "
+                    "Use simpler loops or set LOGIC_MIN_INTERVAL_S."
+                )
+            else:
+                self.performance_warning = None
             commands_by_action, commands_preview = self._summarize_commands(result["commands"])
             self.last_result = {
                 "command_count": len(result["commands"]),
                 "last_run_s": time.time(),
                 "last_runtime_ms": round(runtime_ms, 3),
+                "skipped": False,
                 "params_applied": dict(result["params"]),
                 "commands_by_action": commands_by_action,
                 "commands_preview": commands_preview,
@@ -461,6 +528,7 @@ class ExternalLogicController:
             "active": bool(self.active),
             "logic_name": self.logic_name,
             "logic_description": self.logic_description,
+            "logic_min_interval_s": round(float(self.logic_min_interval_s), 3),
             "source_length": len(source_text),
             "source_line_count": len(source_text.splitlines()) if source_text else 0,
             "analysis_ok": bool(analysis.get("ok")) if isinstance(analysis, dict) else False,
@@ -472,5 +540,8 @@ class ExternalLogicController:
             "analysis": analysis,
             "last_error": self.last_error,
             "last_traceback": self.last_traceback,
+            "runtime_ema_ms": round(float(self.runtime_ema_ms), 3) if self.runtime_ema_ms is not None else None,
+            "slow_run_count": int(self.slow_run_count),
+            "performance_warning": self.performance_warning,
             "last_result": copy.deepcopy(self.last_result),
         }

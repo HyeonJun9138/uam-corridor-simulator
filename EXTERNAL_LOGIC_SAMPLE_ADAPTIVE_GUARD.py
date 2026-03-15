@@ -1,5 +1,12 @@
 #
 # Baseline external traffic-management logic for this simulator.
+# Execution model reminder:
+# - control_step(state) is called once every simulation step
+# - default dt_s is 0.2s, so this usually means about 5 calls per second
+# - module-global variables persist while the logic stays active
+# - use state["t"] plus global cooldown timers if a policy should run every N seconds
+# - use a global initialized flag if a policy should run only once at startup
+#
 # When adapting this file or giving it to another code-generation model:
 # - treat it as the reference structure
 # - keep helper-based conservative command generation
@@ -13,6 +20,7 @@ LOGIC_DESCRIPTION = (
     "500m minimum separation with progressive speed control, "
     "conservative overtake, and defensive turn fallback."
 )
+LOGIC_MIN_INTERVAL_S = 1.0
 
 PARAM_OVERRIDES = {
     "sep_min_m": 500,

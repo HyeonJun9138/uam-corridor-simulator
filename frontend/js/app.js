@@ -24,6 +24,7 @@
   const btnSpawn = $('btn-spawn');
   const btnTheme = $('btn-theme');
   const btnLogicStudio = $('btn-logic-studio');
+  const btnAnalyticsStudio = $('btn-analytics-studio');
   const btnRouteDesign = $('btn-route-design');
   const btnClearRoutes = $('btn-clear-routes');
   const btnResetRoutes = $('btn-reset-routes');
@@ -250,13 +251,14 @@
     if (!nodeId) return '-';
     const node = getNodeMap().get(nodeId);
     if (!node) return nodeId;
+    if (node.display_name) return node.display_name;
     const prefix = node.role === 'start' ? '출발' : node.role === 'end' ? '도착' : '노드';
     return `${prefix} (${node.col * 5}km, R${node.row + 1})`;
   }
 
   function formatRouteLabel(ac) {
     if (!ac?.route_node_ids?.length) return '-';
-    return ac.route_node_ids.join(' → ');
+    return ac.route_node_ids.map((nodeId) => formatNodeLabel(nodeId)).join(' → ');
   }
 
   function formatWaitReason(reason) {
@@ -501,7 +503,7 @@
             <line x1="12" y1="5" x2="12" y2="19"></line>
             <line x1="5" y1="12" x2="19" y2="12"></line>
           </svg>
-          <span class="route-start-btn-label">R${anchor.row + 1}</span>
+          <span class="route-start-btn-label"></span>
         `;
         button.addEventListener('pointerdown', (event) => {
           event.stopPropagation();
@@ -516,6 +518,10 @@
       }
       button.style.left = `${anchor.sx}px`;
       button.style.top = `${anchor.sy}px`;
+      const labelEl = button.querySelector('.route-start-btn-label');
+      if (labelEl) {
+        labelEl.textContent = anchor.short_name || anchor.display_name || `R${anchor.row + 1}`;
+      }
       button.disabled = !anchor.spawn_enabled;
       if (!anchor.spawn_enabled) button.classList.add('is-disabled');
       else button.classList.remove('is-disabled');
@@ -770,6 +776,9 @@
   btnSpawn.addEventListener('click', () => send({ action: 'spawn' }));
   btnLogicStudio?.addEventListener('click', () => {
     window.open('/logic.html', 'uam-logic-studio', 'noopener');
+  });
+  btnAnalyticsStudio?.addEventListener('click', () => {
+    window.open('/graphs.html', 'uam-graph-studio', 'noopener');
   });
 
   btnDelete.addEventListener('click', () => {

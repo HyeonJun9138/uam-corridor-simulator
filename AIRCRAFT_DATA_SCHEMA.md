@@ -3,14 +3,14 @@
 이 문서는 `state.aircraft[].data` 구조를 외부 API 사용자 기준으로 설명합니다.
 
 - 소스 기준: `backend/simulation.py`
-- 현재 스키마 버전: `3`
+- 현재 스키마 버전: `4`
 - 위치: 모든 기체는 `state.aircraft[]` 안에 있고, 상세 정보는 `data` 하위에 있습니다.
 
 ## 1. Top Level
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "identity": {},
   "status": {},
   "mission": {},
@@ -575,3 +575,83 @@ Custom 항로에서만 의미가 있는 합류/교차 노드 관리 정보입니
 - A negative `forward_flow_relative_speed_knots` means the current aircraft is faster than the aircraft ahead and the gap is closing.
 - `spacing.shared_remaining_link_count` is only meaningful for route conflict context.
 - In corridor mode, `shared_remaining_link_count` can stay `0` even when overtake is valid, so do not use it as a straight-corridor overtake gate.
+
+## 19. Naming And Human-Readable Labels
+
+Schema version `4` adds human-readable naming fields so external logic can explain or group aircraft without relying only on raw IDs.
+
+### 19.1 mission naming fields
+
+- `mission.origin_display_name`
+- `mission.origin_short_name`
+- `mission.destination_display_name`
+- `mission.destination_short_name`
+- `mission.route_display_name`
+- `mission.route_node_labels[]`
+- `mission.route_link_labels[]`
+
+Examples:
+
+- `North Terminal A`
+- `South Terminal B`
+- `North Corridor A`
+- `North Terminal A -> South Terminal B`
+
+### 19.2 routing naming fields
+
+`routing` now includes:
+
+- `display_name`
+- `short_name`
+- `route_display_name`
+- `entry_node_display_name`
+- `entry_node_short_name`
+- `exit_node_display_name`
+- `exit_node_short_name`
+- `next_link_display_name`
+- `next_link_short_name`
+
+In `route` mode this names the active link.
+In `corridor` mode this names the active corridor segment such as `Main Segment A`.
+
+### 19.3 operations naming fields
+
+`operations` now also includes:
+
+- `route_display_name`
+- `origin_display_name`
+- `destination_display_name`
+- `active_link_display_name`
+- `active_link_short_name`
+- `entry_node_display_name`
+- `exit_node_display_name`
+- `next_link_display_name`
+
+These are intended for operator-facing summaries, logs, and LLM-generated explanations.
+
+### 19.4 fifo naming fields
+
+`fifo` now also includes:
+
+- `entry_node_display_name`
+- `entry_node_short_name`
+- `exit_node_display_name`
+- `exit_node_short_name`
+- `next_link_display_name`
+- `next_link_short_name`
+
+### 19.5 top-level external logic labels catalog
+
+`get_external_logic_state()` now includes top-level `state["labels"]`:
+
+- `labels.corridor_route`
+- `labels.corridor_segments[]`
+- `labels.route_nodes`
+- `labels.route_links`
+
+Use this when external logic needs a stable lookup table for readable names.
+
+### 19.6 control rule
+
+Use IDs for commands.
+Use display names or short names for grouping, notes, debugging, UI explanations, and CSV exports.

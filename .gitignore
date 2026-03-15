@@ -8,3 +8,4 @@ build/
 .idea/
 api_key
 api_key.txt
+scenario_logs/

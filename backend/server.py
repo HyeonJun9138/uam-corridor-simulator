@@ -20,16 +20,19 @@ from typing import List, Optional
 try:
     from .external_logic_ai import build_logic_review
     from .external_logic import ExternalLogicController
+    from .scenario_logger import ScenarioLogManager
     from .simulation import SimulationEngine, SimParams
 except ImportError:
     from external_logic_ai import build_logic_review
     from external_logic import ExternalLogicController
+    from scenario_logger import ScenarioLogManager
     from simulation import SimulationEngine, SimParams
 
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "EXTERNAL_LOGIC_PROMPT_TEMPLATE.md"
 ROOT_DIR = Path(__file__).resolve().parent.parent
+SCENARIO_LOG_DIR = ROOT_DIR / "scenario_logs"
 
 EXTERNAL_LOGIC_DOWNLOADS = {
     "sample": ROOT_DIR / "EXTERNAL_LOGIC_SAMPLE_ADAPTIVE_GUARD.py",
@@ -56,6 +59,7 @@ sim_running = False
 sim_task: Optional[asyncio.Task] = None
 connected_clients: List[WebSocket] = []
 STATE_PUSH_INTERVAL_S = 1.0 / 20.0
+scenario_logs = ScenarioLogManager(SCENARIO_LOG_DIR, max_scenarios=10, sample_interval_s=1.0, max_points=2400)
 
 
 @asynccontextmanager
@@ -106,6 +110,40 @@ async def download_external_logic_kit(kit_key: str):
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
 
+@app.get("/api/analytics/current")
+async def get_current_analytics():
+    return scenario_logs.get_current_payload()
+
+
+@app.get("/api/analytics/scenarios")
+async def list_analytics_scenarios():
+    return {"scenarios": scenario_logs.list_scenarios()}
+
+
+@app.get("/api/analytics/scenario/{scenario_id}.zip")
+async def download_analytics_scenario(scenario_id: str):
+    try:
+        buffer = scenario_logs.build_scenario_zip(scenario_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    headers = {
+        "Content-Disposition": f'attachment; filename="{scenario_id}.zip"',
+    }
+    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+
+
+@app.get("/api/analytics/scenario/{scenario_id}/file/{filename}")
+async def download_analytics_scenario_file(scenario_id: str, filename: str):
+    path = scenario_logs.resolve_scenario_file(scenario_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="scenario file not found")
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="text/csv",
+    )
+
+
 async def broadcast(data: dict):
     msg = json.dumps(data)
     disconnected = []
@@ -127,11 +165,62 @@ def build_state_payload(show_density: bool = True, show_congestion: bool = True,
         show_segments=show_segments,
     )
     state["external_logic"] = external_logic.get_status()
+    scenario_logs.record_state(state)
     return state
+
+
+def build_logic_state_payload() -> dict:
+    state = sim_engine.get_external_logic_state()
+    state["external_logic"] = external_logic.get_status()
+    return state
+
+
+def get_param_snapshot() -> dict:
+    p = sim_engine.p
+    return {
+        "simulation_mode": p.simulation_mode,
+        "path_length_m": p.path_length_m,
+        "lane_width_m": p.lane_width_m,
+        "spawn_margin_m": p.spawn_margin_m,
+        "auto_spawn_enabled": p.auto_spawn_enabled,
+        "spawn_spacing_m": p.spawn_spacing_m,
+        "route_grid_spacing_m": p.route_grid_spacing_m,
+        "route_row_count": p.route_row_count,
+        "route_row_gap_m": p.route_row_gap_m,
+        "v_free_knots": p.v_free_knots,
+        "v_init_knots": p.v_init_knots,
+        "v_min_knots": p.v_min_knots,
+        "v_max_knots": p.v_max_knots,
+        "wind_enabled": p.wind_enabled,
+        "wind_level": p.wind_level,
+        "a_max_mps2": p.a_max_mps2,
+        "b_max_mps2": p.b_max_mps2,
+        "sep_min_m": p.sep_min_m,
+        "fifo_queue_sep_scale": p.fifo_queue_sep_scale,
+        "fifo_node_clearance_min_m": p.fifo_node_clearance_min_m,
+        "fifo_node_clearance_scale": p.fifo_node_clearance_scale,
+        "fifo_hold_buffer_min_m": p.fifo_hold_buffer_min_m,
+        "fifo_hold_buffer_scale": p.fifo_hold_buffer_scale,
+        "fifo_approach_sep_scale": p.fifo_approach_sep_scale,
+        "fifo_approach_time_s": p.fifo_approach_time_s,
+        "segment_length_m": p.segment_length_m,
+        "seg_w_overflow": p.seg_w_overflow,
+        "seg_w_tti": p.seg_w_tti,
+        "sigma_parallel_m": p.sigma_parallel_m,
+        "sigma_perp_m": p.sigma_perp_m,
+        "lookahead_L_m": p.lookahead_L_m,
+        "delay_window_T_s": p.delay_window_T_s,
+        "delayed_thr_s": p.delayed_thr_s,
+        "rho_ref": p.rho_ref,
+        "cong_ref": p.cong_ref,
+        "dt_s": p.dt_s,
+        "realtime_factor": p.realtime_factor,
+    }
 
 
 def apply_param_updates(params: dict) -> dict:
     p = sim_engine.p
+    prev_v_free_knots = float(p.v_free_knots)
     applied = {}
     errors = []
     for key, val in params.items():
@@ -162,9 +251,20 @@ def apply_param_updates(params: dict) -> dict:
     if p.sigma_parallel_m > sigpar_max:
         p.sigma_parallel_m = sigpar_max
     sim_engine.normalize_model_params()
+    if "v_free_knots" in applied:
+        sim_engine.apply_global_free_speed(prev_v_free_knots)
     for key in list(applied.keys()):
         applied[key] = getattr(p, key)
+    scenario_logs.update_params(get_param_snapshot())
     return {"applied": applied, "errors": errors}
+
+
+def start_new_scenario(reason: str) -> None:
+    scenario_logs.start_new_scenario(get_param_snapshot(), reason=reason)
+
+
+start_new_scenario("startup")
+scenario_logs.record_state(sim_engine.get_full_state(show_density=False, show_congestion=False, show_segments=True))
 
 
 def apply_control_command(command: dict) -> dict:
@@ -214,7 +314,10 @@ def apply_control_command(command: dict) -> dict:
 def run_external_logic_step():
     if not external_logic.active:
         return
-    logic_state = build_state_payload(show_density=False, show_congestion=False, show_segments=True)
+    if external_logic.should_skip_for_cadence(sim_engine.t_s):
+        external_logic.record_cadence_skip(sim_engine.t_s)
+        return
+    logic_state = build_logic_state_payload()
     result = external_logic.run_step(logic_state)
     if not result.get("ok"):
         return
@@ -295,6 +398,7 @@ async def websocket_endpoint(ws: WebSocket):
                     sim_task.cancel()
                     sim_task = None
                 sim_engine.reset()
+                start_new_scenario("reset")
                 state = build_state_payload()
                 state["type"] = "state"
                 await broadcast(state)
@@ -367,6 +471,7 @@ async def websocket_endpoint(ws: WebSocket):
                 mode = msg.get("mode", "corridor")
                 sim_engine.set_simulation_mode(mode)
                 sim_engine.reset()
+                start_new_scenario(f"set_mode:{mode}")
                 state = build_state_payload()
                 state["type"] = "state"
                 await broadcast(state)
@@ -381,6 +486,7 @@ async def websocket_endpoint(ws: WebSocket):
                         sim_task.cancel()
                         sim_task = None
                     sim_engine.reset()
+                    start_new_scenario("toggle_route_link")
                     state = build_state_payload()
                     state["type"] = "state"
                     await broadcast(state)
@@ -393,6 +499,7 @@ async def websocket_endpoint(ws: WebSocket):
                     sim_task = None
                 sim_engine.clear_route_links()
                 sim_engine.reset()
+                start_new_scenario("clear_route_links")
                 state = build_state_payload()
                 state["type"] = "state"
                 await broadcast(state)
@@ -405,6 +512,7 @@ async def websocket_endpoint(ws: WebSocket):
                     sim_task = None
                 sim_engine.reset_route_links()
                 sim_engine.reset()
+                start_new_scenario("reset_route_links")
                 state = build_state_payload()
                 state["type"] = "state"
                 await broadcast(state)
@@ -429,7 +537,7 @@ async def websocket_endpoint(ws: WebSocket):
                     build_logic_review,
                     code,
                     analysis,
-                    build_state_payload(show_density=False, show_congestion=False, show_segments=True),
+                    build_logic_state_payload(),
                 )
                 if isinstance(explanation, dict):
                     analysis["explanation"] = explanation

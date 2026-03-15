@@ -1,520 +1,93 @@
 # External API Guide
 
-이 문서는 외부 시스템이 이 시뮬레이터를 읽고 제어하는 방법을 정리한 기준 문서입니다.
+이 문서는 외부 시스템 또는 LLM이 이 시뮬레이터의 외부 로직 계약을 정확히 이해하도록 정리한 최소 가이드입니다.
 
-- 실시간 상태 수신: WebSocket `/ws`
-- 개별 기체 제어: `set_speed`, `turn`, `overtake`, `spawn`, `delete`
-- 시뮬레이터 규칙 변경: `update_params`
-- 외부 코드 실행형 제어: `logic_analyze`, `logic_activate`, `logic_deactivate`, `logic_apply_params`
+핵심 요약:
+- 외부 로직은 `control_step(state)`로 작성한다.
+- 이 함수는 시뮬레이션의 **매 simulation step마다 1회** 호출된다.
+- 기본 `dt_s`는 `0.2s`이므로 보통 초당 약 5회 호출된다.
+- 따라서 외부 로직은 "한 번만 실행"되는 함수가 아니라 **계속 반복 호출되는 제어 루프**로 봐야 한다.
+- 고수준 명령(`turn`, `overtake`, `spawn`, `delete`, `update_params`)은 one-shot 성격이고, `set_speed`는 persistent 성격이다.
+- 성능 보호를 위해 외부 로직에는 full UI state가 아니라 compact logic state만 전달된다.
+- 무거운 정책은 `LOGIC_MIN_INTERVAL_S`를 사용해 cadence를 낮추는 것이 권장된다.
 
-외부 시스템은 두 가지 방식으로 붙을 수 있습니다.
+## 1. Execution Model
 
-1. 자체 프로그램이 `/ws`에 직접 연결해서 상태를 읽고 명령을 보내는 방식
-2. 브라우저의 `외부 로직` 창에서 Python 코드를 붙여 넣어 시뮬레이터 내부에서 매 step 실행시키는 방식
+외부 로직은 다음 순서로 동작한다.
 
-## 1. Transport
+1. 현재 시뮬레이터 상태를 `state`로 만든다.
+2. 외부 로직 `control_step(state)`를 호출한다.
+3. 외부 로직이 `commands`, `params`, `notes`를 반환한다.
+4. 서버가 반환된 명령을 엔진에 적용한다.
+5. 엔진이 실제 물리 step과 안전 판정을 수행한다.
 
-- 프로토콜: WebSocket
-- 경로: `/ws`
-- 주요 서버 푸시 메시지: `type = "state"`
-- 주요 클라이언트 송신 메시지: `action = ...`
+즉 외부 로직은 "정책 제안자"이고, 엔진은 "최종 집행자"다.
 
-상태 메시지는 시뮬레이션이 실행 중이면 주기적으로 브로드캐스트되고, 정지 중에는 주요 액션 이후 즉시 갱신됩니다.
+### 1.1 Call Frequency
 
-## 2. Top-Level State
+- `control_step(state)`는 **매 simulation step**마다 1회 호출된다.
+- 기본 `dt_s`는 `0.2s`다.
+- 따라서 기본적으로 약 **5 Hz**다.
+- `dt_s`와 `realtime_factor`는 바뀔 수 있으므로, 외부 로직은 절대로 "초당 1회"로 가정하면 안 된다.
 
-서버가 보내는 대표 상태 구조는 아래와 같습니다.
+### 1.2 Time Reference
 
-```json
-{
-  "type": "state",
-  "t": 12.4,
-  "mode": "route",
-  "aircraft": [],
-  "heatmaps": null,
-  "segments": [],
-  "summary": {},
-  "wind": {},
-  "route_network": {},
-  "params": {},
-  "external_logic": {}
-}
-```
+- 현재 시뮬레이션 시간은 `state["t"]`에 들어온다.
+- 단위는 초다.
+- "매 1초마다", "매 5초마다", "매 10분마다" 같은 정책은 모두 `state["t"]` 기준으로 구현해야 한다.
 
-### 주요 필드
+### 1.3 Persistent Globals
 
-- `t`: 현재 시뮬레이션 시간 초 단위
-- `mode`: `corridor` 또는 `route`
-- `aircraft`: 전체 기체 목록
-- `heatmaps`: 현재 히트맵 데이터
-- `segments`: 직선 항로 세그먼트 또는 Custom 항로 링크 단위 혼잡 데이터
-- `summary`: 전체 요약 지표
-- `wind`: 전역 바람 상태
-- `route_network`: Custom 항로 노드/링크/경로 정보
-- `params`: 현재 적용 중인 전역 파라미터
-- `external_logic`: 현재 활성 외부 로직 상태
+외부 로직 코드의 module-global 변수는 로직이 활성화된 동안 유지된다.
 
-## 2.1 `external_logic` Status Object
+따라서 아래 같은 상태를 global 변수로 저장해도 된다.
+- startup 1회 실행 여부
+- 기체별 마지막 명령 시각
+- 기체별 cooldown
+- 다음 의사결정 시각
+- 최근 추월/선회 목표
 
-상태 메시지의 `external_logic`는 현재 외부 로직 엔진 상태를 그대로 담습니다.
+단, 사용자가 코드를 수정하거나 로직을 다시 활성화하면 이 global 상태는 초기화된다고 보면 된다.
 
-```json
-{
-  "active": true,
-  "logic_name": "My Logic",
-  "logic_description": "설명",
-  "source_length": 1280,
-  "source_line_count": 42,
-  "analysis_ok": true,
-  "function_name": "control_step",
-  "function_count": 1,
-  "detected_param_count": 2,
-  "warning_count": 0,
-  "error_count": 0,
-  "analysis": {},
-  "last_error": null,
-  "last_traceback": null,
-  "last_result": {}
-}
-```
+### 1.4 How To Implement Cadence Correctly
 
-### `last_result`
+#### 매 step마다 실행되는 로직
 
-```json
-{
-  "command_count": 3,
-  "last_run_s": 1710000000.0,
-  "last_runtime_ms": 0.421,
-  "params_applied": {
-    "sep_min_m": 500
-  },
-  "commands_by_action": {
-    "set_speed": 2,
-    "spawn": 1
-  },
-  "commands_preview": [
-    {"action": "set_speed", "id": 1, "speed": 85}
-  ],
-  "note_count": 2,
-  "notes": [
-    "forward gap guard applied"
-  ]
-}
-```
+예:
+- 분리 감시
+- wait 상태 감시
+- 현재 conflict 감시
+- 매 step speed correction
 
-주요 의미:
+이 경우 `control_step(state)` 안에서 매 호출마다 바로 판단하면 된다.
 
-- `source_length`, `source_line_count`: 현재 활성 코드 크기
-- `analysis_ok`: 최근 분석 기준 정상 여부
-- `function_count`: 코드 안 함수 개수
-- `detected_param_count`: 감지된 `PARAM_OVERRIDES` 항목 수
-- `warning_count`, `error_count`: 분석 결과 수
-- `commands_by_action`: 최근 step에서 action별 명령 개수
-- `commands_preview`: 최근 명령 일부 미리보기
-- `note_count`, `notes`: 로직이 반환한 notes
+#### 매 N초마다 실행되는 로직
 
-## 3. Aircraft State
+예:
+- 1초마다 추월 판단
+- 5초마다 생성 판단
+- 10초마다 global parameter tuning
 
-각 `aircraft[]` 항목은 빠른 UI용 기본 필드와, 정밀 제어용 `data` 필드를 동시에 가집니다.
+이 경우 `state["t"]`와 global `next_run_t`를 사용해 직접 gate 해야 한다.
 
-```json
-{
-  "id": 12,
-  "x": 1530.2,
-  "y": 100.0,
-  "heading_rad": 0.0,
-  "remaining_m": 18469.8,
-  "v_act_knots": 95.0,
-  "v_cmd_knots": 100.0,
-  "sta_s": 780.0,
-  "eta_s": 805.4,
-  "tti": 1.03,
-  "battery_remaining_s": 1700.0,
-  "battery_pct": 94.4,
-  "l": 0.050,
-  "D": 3.2,
-  "R": 0.200,
-  "c": 0.420,
-  "delayed": false,
-  "managed": false,
-  "action": null,
-  "action_phase": "idle",
-  "action_meta": null,
-  "origin_node_id": "R1C0",
-  "destination_node_id": "R1C4",
-  "wait_reason": null,
-  "data": {}
-}
-```
+#### 시작 시 1회만 실행되는 로직
 
-정밀 스키마는 [AIRCRAFT_DATA_SCHEMA.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/AIRCRAFT_DATA_SCHEMA.md)를 기준으로 사용하면 됩니다.
+예:
+- 처음 활성화될 때 `sep_min_m` 오버라이드
+- 시뮬레이션 시작 직후 특정 spawn 배치
 
-외부 제어 로직에서 특히 자주 보는 섹션은 아래입니다.
+이 경우 global `initialized = False` 같은 플래그를 두고 첫 실행에만 동작시켜야 한다.
 
-- `data.control`
-- `data.operations`
-- `data.spacing`
-- `data.routing`
-- `data.fifo`
-- `data.parameters`
-- `data.wind`
-- `data.schedule`
+## 2. What External Logic Can Control
 
-## 4. Global Params
+외부 로직은 한 번의 `control_step(state)` 호출에서 여러 기체를 동시에 조정할 수 있다.
 
-상태의 `params`는 현재 시뮬레이터 전역 설정의 즉시 스냅샷입니다.
+즉:
+- 전체 `state["aircraft"]`를 읽을 수 있고
+- 같은 step에서 여러 기체에 대해 명령을 만들 수 있다
+- 단, 한 step당 전체 명령 수는 최대 256개다
 
-대표 항목:
-
-- `simulation_mode`
-- `path_length_m`
-- `lane_width_m`
-- `spawn_margin_m`
-- `auto_spawn_enabled`
-- `spawn_spacing_m`
-- `route_grid_spacing_m`
-- `route_row_count`
-- `route_row_gap_m`
-- `v_free_knots`
-- `v_init_knots`
-- `v_min_knots`
-- `v_max_knots`
-- `wind_enabled`
-- `wind_level`
-- `a_max_mps2`
-- `b_max_mps2`
-- `sep_min_m`
-- `fifo_queue_sep_scale`
-- `fifo_node_clearance_min_m`
-- `fifo_node_clearance_scale`
-- `fifo_hold_buffer_min_m`
-- `fifo_hold_buffer_scale`
-- `fifo_approach_sep_scale`
-- `fifo_approach_time_s`
-- `segment_length_m`
-- `seg_w_overflow`
-- `seg_w_tti`
-- `sigma_parallel_m`
-- `sigma_perp_m`
-- `lookahead_L_m`
-- `delay_window_T_s`
-- `delayed_thr_s`
-- `rho_ref`
-- `cong_ref`
-- `dt_s`
-- `realtime_factor`
-
-주의:
-
-- 일부 파라미터는 모드 전용입니다. 예: FIFO 계열은 `route`에서 의미가 큽니다.
-- 파라미터 적용 시 내부 정규화가 걸립니다. 예: `sigma_parallel_m`은 최소 분리 기준으로 clamp될 수 있습니다.
-- 서버 응답의 `report.applied`는 정규화 후 실제 반영값입니다.
-
-## 5. Incoming Commands
-
-외부 시스템은 아래 메시지를 `/ws`로 보냅니다.
-
-### 5.1 시뮬레이션 제어
-
-#### 시작
-
-```json
-{ "action": "start" }
-```
-
-#### 일시정지
-
-```json
-{ "action": "pause" }
-```
-
-#### 리셋
-
-```json
-{ "action": "reset" }
-```
-
-#### 1 step 실행
-
-```json
-{ "action": "step" }
-```
-
-#### 모드 변경
-
-```json
-{ "action": "set_mode", "mode": "corridor" }
-```
-
-또는
-
-```json
-{ "action": "set_mode", "mode": "route" }
-```
-
-### 5.2 개별 기체 제어
-
-#### 속도 지시
-
-```json
-{
-  "action": "set_speed",
-  "id": 12,
-  "speed": 90
-}
-```
-
-#### 우선회
-
-```json
-{
-  "action": "turn",
-  "id": 12,
-  "diameter_m": 800
-}
-```
-
-#### 추월
-
-```json
-{
-  "action": "overtake",
-  "id": 12,
-  "lateral_offset_m": 100,
-  "speed_boost_knots": 20,
-  "target_id": 9
-}
-```
-
-설명:
-
-- `target_id`는 선택 사항이지만, 외부 교통관리 로직에서는 명시 지정이 권장됩니다.
-- 실제 추월 가능 여부는 엔진이 다시 판단합니다.
-
-#### 생성
-
-직선 항로:
-
-```json
-{ "action": "spawn" }
-```
-
-Custom 항로 특정 시작 노드:
-
-```json
-{
-  "action": "spawn",
-  "start_node_id": "R1C0"
-}
-```
-
-#### 삭제
-
-```json
-{
-  "action": "delete",
-  "id": 12
-}
-```
-
-### 5.3 파라미터 변경
-
-```json
-{
-  "action": "update_params",
-  "params": {
-    "sep_min_m": 250,
-    "fifo_approach_time_s": 5.0
-  }
-}
-```
-
-서버는 `params_ack` 메시지로 결과를 돌려줍니다.
-
-```json
-{
-  "type": "params_ack",
-  "params": { "...": "..." },
-  "report": {
-    "applied": { "...": "..." },
-    "errors": []
-  }
-}
-```
-
-## 6. External Logic Messages
-
-외부 로직 창 또는 자체 클라이언트는 아래 액션을 사용할 수 있습니다.
-
-### 6.1 코드 분석
-
-```json
-{
-  "action": "logic_analyze",
-  "code": "..."
-}
-```
-
-분석 시 추가로 확인해야 하는 제약:
-
-- 코드 길이 최대 40,000자
-- `control_step(state)` 필수
-- 금지 AST 구문/호출 포함 시 실패
-
-응답:
-
-```json
-{
-  "type": "logic_analysis",
-  "analysis": {
-    "ok": true,
-    "function_name": "control_step",
-    "detected_params": {},
-    "errors": [],
-    "warnings": [],
-    "summary": []
-  }
-}
-```
-
-### 6.2 코드 활성화
-
-```json
-{
-  "action": "logic_activate",
-  "code": "...",
-  "auto_apply_detected_params": true
-}
-```
-
-활성화 시에는 분석 통과 후 한 번 더 probe state로 실행 검증합니다. 분석은 통과했어도 실행 검증에 실패하면 활성화되지 않습니다.
-
-응답:
-
-```json
-{
-  "type": "logic_activation",
-  "ok": true,
-  "analysis": {},
-  "logic": {},
-  "param_report": {
-    "applied": {},
-    "errors": []
-  }
-}
-```
-
-### 6.3 코드 비활성화
-
-```json
-{ "action": "logic_deactivate" }
-```
-
-응답:
-
-```json
-{
-  "type": "logic_status",
-  "logic": {
-    "active": false
-  }
-}
-```
-
-### 6.4 감지된 파라미터만 적용
-
-```json
-{
-  "action": "logic_apply_params",
-  "params": {
-    "sep_min_m": 500
-  }
-}
-```
-
-응답:
-
-```json
-{
-  "type": "logic_params_applied",
-  "params": {
-    "sep_min_m": 500
-  },
-  "report": {
-    "applied": {
-      "sep_min_m": 500.0
-    },
-    "errors": []
-  }
-}
-```
-
-### 6.5 현재 로직 상태 조회
-
-```json
-{ "action": "logic_get_status" }
-```
-
-응답:
-
-```json
-{
-  "type": "logic_status",
-  "logic": {
-    "active": true,
-    "logic_name": "My Logic",
-    "logic_description": "..."
-  }
-}
-```
-
-## 7. External Logic Code Contract
-
-외부 코드 실행형 제어는 Python 코드 문자열을 받아 실행합니다.
-
-### 필수 함수
-
-```python
-def control_step(state):
-    return {"commands": [], "params": {}}
-```
-
-### 선택 상수
-
-```python
-LOGIC_NAME = "My Logic"
-LOGIC_DESCRIPTION = "설명"
-PARAM_OVERRIDES = {"sep_min_m": 500}
-```
-
-### 반환 형식
-
-허용 형식 1:
-
-```python
-return {
-    "commands": [...],
-    "params": {...},
-    "notes": [...]
-}
-```
-
-허용 형식 2:
-
-```python
-return [
-    {"action": "set_speed", "id": 1, "speed": 90}
-]
-```
-
-주의:
-
-- 한 step당 명령 최대 256개
-- `notes`는 선택 사항이지만, 디버깅을 위해 권장
-- `params`는 현재 step에서 즉시 파라미터 반영용
-
-### 허용 명령
-
+지원 명령:
 - `set_speed`
 - `turn`
 - `overtake`
@@ -522,59 +95,256 @@ return [
 - `delete`
 - `update_params`
 
-### 안전 제약
+## 3. Command Semantics
 
-아래는 금지됩니다.
+이 부분을 잘못 이해하면 LLM이 이상한 로직을 만든다.
 
-- `import`
-- `while`
-- `try`
-- `with`
-- `async`
-- `lambda`
-- `class`
-- dunder 이름 접근
-- `open`, `eval`, `exec`, `__import__` 등 위험 호출
+### 3.1 `set_speed`
 
-추가 참고:
+- persistent 명령이다
+- 한 번 보내면 그 기체의 command speed가 바뀌고, 이후 다시 바꾸기 전까지 유지된다
+- 따라서 매 step마다 같은 `set_speed`를 계속 보낼 필요는 없다
 
-- `math`는 이미 주입되어 있으므로 `import math`를 쓰지 않아야 합니다.
-- 허용 빌트인은 `abs`, `all`, `any`, `bool`, `dict`, `enumerate`, `float`, `int`, `len`, `list`, `max`, `min`, `range`, `round`, `set`, `sorted`, `str`, `sum`, `tuple`, `zip` 정도입니다.
+### 3.2 `turn`
 
-허용 빌트인은 제한적이며, `math` 모듈만 노출됩니다.
+- one-shot 명령이다
+- 선회 action을 시작시키는 요청이다
+- 이미 `action` 중인 기체에 계속 반복 전송하면 안 된다
 
-## 8. Recommended Logic Design Pattern
+### 3.3 `overtake`
 
-외부 TM/UATM 로직은 보통 아래 순서로 작성하면 안정적입니다.
+- one-shot 명령이다
+- 추월 action을 시작시키는 요청이다
+- 이미 `action` 중인 기체에 반복 전송하면 안 된다
 
-1. `data.operations`로 현재 phase와 hold 원인을 확인
-2. `data.spacing`으로 전방/후방 거리와 최근접 conflict를 확인
-3. `data.fifo`로 노드 통과 가능 여부와 queue 순번을 확인
-4. `data.routing`으로 현재 링크 또는 세그먼트 상황을 확인
-5. `data.wind`로 종풍/횡풍 영향을 반영
-6. `data.control`로 지금 명령 가능한 상태인지 확인
-7. 필요 시 `data.parameters`를 기준으로 현재 운영 규칙에 맞춰 판단
+### 3.4 `spawn`
 
-## 9. Recommended Failure Handling
+- one-shot 명령이다
+- 조건 없이 매 step 보내면 계속 새 기체가 생성된다
+- 따라서 반드시 시간 gate나 조건 gate를 둬야 한다
 
-외부 시스템은 아래를 반드시 고려하는 편이 좋습니다.
+### 3.5 `delete`
 
-- 특정 기체가 이미 `action != null`이면 중복 명령을 피할 것
-- `can_issue_now`가 `false`인 제어는 보내지 않거나 별도 큐잉할 것
-- FIFO 합류 전후에는 `wait_reason`, `can_cross_node_now`, `can_enter_next_link_now`를 같이 볼 것
-- 추월은 `data.control.overtake.candidate_target_aircraft_id`와 `data.spacing`을 함께 볼 것
-- `report.errors`가 있으면 외부 UI에 그대로 표시할 것
+- one-shot 명령이다
+- 보통 목적지 도착 직전 또는 특정 실험 조건에서만 사용한다
 
-## 10. Related Docs
+### 3.6 `update_params`
 
-- [AIRCRAFT_DATA_SCHEMA.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/AIRCRAFT_DATA_SCHEMA.md)
-- [EXTERNAL_LOGIC_STUDIO_GUIDE.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_LOGIC_STUDIO_GUIDE.md)
-- [EXTERNAL_LOGIC_PROMPT_TEMPLATE.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_LOGIC_PROMPT_TEMPLATE.md)
-- [EXTERNAL_LOGIC_SAMPLE_ADAPTIVE_GUARD.py](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/EXTERNAL_LOGIC_SAMPLE_ADAPTIVE_GUARD.py)
+- one-shot 명령이지만, 결과는 전역적으로 지속된다
+- 예를 들어 `sep_min_m`를 한 번 500으로 바꾸면 이후 step에도 계속 500이 유지된다
+- 따라서 startup 1회 또는 느린 cadence로만 보내는 것이 일반적이다
 
-## 11. External Logic Pitfalls
+## 4. Engine Has Final Authority
 
-- `spacing.forward_flow_relative_speed_knots` is `front - self`, not `self - front`.
-- If `forward_flow_relative_speed_knots < 0`, the current aircraft is faster than the aircraft ahead.
-- `control.overtake.can_issue_now` already includes engine-side candidate filtering.
-- `spacing.shared_remaining_link_count` is a route conflict metric and should not be used as a mandatory corridor overtake condition.
+외부 로직이 명령을 만든다고 해서 무조건 실행되는 것은 아니다.
+
+엔진은 최종적으로 다음을 다시 판정한다.
+- 실제 분리 가능성
+- 추월 가능성
+- 선회 가능성
+- merge 진입 가능성
+- FIFO / node release / downstream separation
+
+즉 외부 로직은 정책을 제안하지만, 엔진 feasibility check가 마지막에 명령을 거절할 수 있다.
+
+중요 신호:
+- `control.speed.can_issue_now`
+- `control.turn.can_issue_now`
+- `control.overtake.can_issue_now`
+
+이 값이 false이면 해당 명령은 보내지 않는 것이 맞다.
+
+## 5. Node / FIFO Rules
+
+Node 운영 규칙은 엔진 내부에 들어 있다.
+
+### 5.1 Wait Reasons
+
+대표 `wait_reason`:
+- `spacing`
+- `start_hold`
+- `fifo_hold`
+- `node_hold`
+- `merge_hold`
+
+### 5.2 Straight Node vs Merge Node
+
+- `route` 모드에서 FIFO는 **merge node**에서만 의미가 있다
+- straight node는 FIFO 운영 대상이 아니다
+- 따라서 단순 직선 route node를 merge처럼 해석하면 안 된다
+
+### 5.3 What External Logic Should Read
+
+외부 로직은 아래 필드를 읽고 의사결정하면 된다.
+- `ac["data"]["fifo"]["enabled"]`
+- `ac["data"]["fifo"]["queue_rank"]`
+- `ac["data"]["fifo"]["can_cross_node_now"]`
+- `ac["data"]["fifo"]["can_enter_next_link_now"]`
+- `ac["data"]["status"]["wait_reason"]`
+
+단, node scheduler 자체를 외부 로직이 다시 구현하려고 하지 말고, 엔진 상태를 보고 정책만 조정하는 것이 맞다.
+
+## 6. Important Aircraft Fields
+
+자세한 전체 스키마는 [AIRCRAFT_DATA_SCHEMA.md](C:/Users/AISIMULATOR2/Desktop/Code/uam_congestion/AIRCRAFT_DATA_SCHEMA.md)를 본다.
+
+외부 로직에서 자주 보는 영역:
+- `ac["data"]["status"]`
+- `ac["data"]["operations"]`
+- `ac["data"]["spacing"]`
+- `ac["data"]["routing"]`
+- `ac["data"]["fifo"]`
+- `ac["data"]["control"]`
+- `ac["data"]["flow"]`
+- `ac["data"]["wind"]`
+- `ac["data"]["parameters"]`
+
+특히 자주 쓰는 필드:
+- `forward_flow_gap_m`
+- `nearest_conflict_distance_m`
+- `forward_flow_relative_speed_knots`
+- `candidate_target_aircraft_id`
+- `can_issue_now`
+- `queue_rank`
+- `can_cross_node_now`
+- `can_enter_next_link_now`
+- `phase`
+- `action`
+- `wait_reason`
+
+### 6.1 Relative Speed Sign Convention
+
+중요:
+- `spacing.forward_flow_relative_speed_knots`는 `front - self`다
+- 음수면 현재 기체가 더 빠르다
+- 양수면 앞 기체가 더 빠르다
+
+## 7. Top-Level State
+
+외부 로직이 받는 top-level state의 핵심 필드:
+
+```json
+{
+  "t": 12.4,
+  "mode": "route",
+  "aircraft": [],
+  "params": {},
+  "summary": {},
+  "external_logic": {}
+}
+```
+
+주요 의미:
+- `t`: 현재 시뮬레이션 시간
+- `mode`: `corridor` 또는 `route`
+- `aircraft`: 현재 기체 리스트
+- `params`: 현재 전역 파라미터
+- `summary`: 전체 요약
+- `external_logic`: 현재 외부 로직 상태
+
+## 8. WebSocket Actions
+
+기본 WebSocket 경로:
+- `/ws`
+
+주요 action:
+- `start`
+- `pause`
+- `reset`
+- `step`
+- `set_mode`
+- `set_speed`
+- `turn`
+- `overtake`
+- `spawn`
+- `delete`
+- `update_params`
+- `logic_analyze`
+- `logic_activate`
+- `logic_deactivate`
+- `logic_apply_params`
+
+## 9. Practical Design Guidance For LLM-Generated Logic
+
+LLM이 가장 자주 틀리는 포인트는 아래다.
+
+1. `control_step(state)`가 1회성 함수라고 오해함
+2. `set_speed`를 one-shot으로 이해하지 못함
+3. `turn`/`overtake`를 매 step 반복 발행함
+4. startup 1회 로직과 continuous 감시 로직을 구분하지 않음
+5. `state["t"]`를 사용하지 않고 "초당 1회"라고 가정함
+6. straight node에도 FIFO를 적용하려고 함
+7. 모든 기체를 매 step 중첩 루프로 전부 비교해 O(N^2) 코드를 만듦
+8. 매 step마다 불필요하게 full sort를 반복함
+
+따라서 LLM 프롬프트에는 아래를 꼭 명시해야 한다.
+- 실행 cadence
+- startup 1회 동작 여부
+- continuous 감시 동작 여부
+- high-level action cooldown
+- 같은 기체에 한 step에서 명령 1개 제한 여부
+
+## 10. Performance Guidance
+
+외부 로직이 느려지면 시뮬레이터 전체가 같이 느려진다. 이유는 외부 로직이 메인 시뮬레이션 루프 안에서 실행되기 때문이다.
+
+권장 사항:
+- 특별한 이유가 없으면 `LOGIC_MIN_INTERVAL_S = 1.0` 또는 `2.0`부터 시작
+- `turn`, `overtake`, `spawn`, `delete`, `update_params`는 per-step이 아니라 느린 cadence나 cooldown으로 실행
+- 가능한 한 엔진이 제공하는 후보 필드(`candidate_target_aircraft_id`, `can_issue_now`, `wait_reason`, `queue_rank`)를 직접 사용
+- 매 step 전체 기체 중첩 비교 O(N^2) 금지
+- 매 step 전체 정렬 반복 금지
+- 필요하면 기체별 마지막 명령 시각을 global dict에 저장해서 중복 판단을 줄일 것
+
+외부 로직 상태에는 아래 성능 필드가 포함된다.
+- `logic_min_interval_s`
+- `runtime_ema_ms`
+- `slow_run_count`
+- `performance_warning`
+
+즉 외부 로직이 과하게 무거우면 상태 패널에서 바로 확인할 수 있다.
+
+## 11. Recommended Minimal Delivery Set
+
+외부 사용자에게 코드 생성을 맡길 때는 보통 아래 2개만 전달하면 된다.
+- `EXTERNAL_LOGIC_SAMPLE_ADAPTIVE_GUARD.py`
+- `EXTERNAL_LOGIC_PROMPT_TEMPLATE.md`
+
+외부 시스템이 직접 `/ws`에 붙어서 제어까지 할 경우에는 아래도 추가한다.
+- `EXTERNAL_API_GUIDE.md`
+- `AIRCRAFT_DATA_SCHEMA.md`
+
+## Human-Readable Labels For External Logic
+
+External logic can now rely on readable names as well as raw IDs.
+
+### Per-aircraft labels
+
+Useful fields:
+
+- `ac["data"]["mission"]["origin_display_name"]`
+- `ac["data"]["mission"]["destination_display_name"]`
+- `ac["data"]["mission"]["route_display_name"]`
+- `ac["data"]["routing"]["display_name"]`
+- `ac["data"]["routing"]["short_name"]`
+- `ac["data"]["operations"]["active_link_display_name"]`
+- `ac["data"]["fifo"]["exit_node_display_name"]`
+
+These fields are for explanation, grouping, route selection, and notes.
+Commands must still use IDs, not names.
+
+### Top-level labels catalog
+
+`control_step(state)` now also receives:
+
+- `state["labels"]["corridor_route"]`
+- `state["labels"]["corridor_segments"]`
+- `state["labels"]["route_nodes"]`
+- `state["labels"]["route_links"]`
+
+This catalog is useful when external logic needs a stable readable lookup table without scanning every aircraft.
+
+### Recommended usage rule
+
+- Use `*_id` fields when issuing commands.
+- Use `*_display_name` or `*_short_name` for notes, logs, reports, LLM summaries, or route grouping.
